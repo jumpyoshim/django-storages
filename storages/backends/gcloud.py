@@ -8,7 +8,7 @@ from django.utils import timezone
 from django.utils.deconstruct import deconstructible
 from django.utils.encoding import force_bytes, smart_str
 
-from storages.utils import clean_name, safe_join, setting
+from storages.utils import check_location, clean_name, safe_join, setting
 
 try:
     from google.cloud.storage.client import Client
@@ -101,7 +101,8 @@ class GoogleCloudStorage(Storage):
             if hasattr(self, name):
                 setattr(self, name, value)
 
-        self.location = (self.location or '').lstrip('/')
+        check_location(self)
+
         self._bucket = None
         self._client = None
 
@@ -167,6 +168,7 @@ class GoogleCloudStorage(Storage):
         encoded_name = self._encode_name(name)
         file = GoogleCloudFile(encoded_name, 'rw', self)
         file.blob.cache_control = self.cache_control
+        content.seek(0)
         file.blob.upload_from_file(content, size=content.size,
                                    content_type=file.mime_type)
         if self.default_acl:

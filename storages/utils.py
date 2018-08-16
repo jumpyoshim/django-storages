@@ -1,6 +1,8 @@
+import os
 import posixpath
 
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.utils.encoding import force_text
 
 
@@ -72,3 +74,26 @@ def safe_join(base, *paths):
                          ' component')
 
     return final_path.lstrip('/')
+
+
+def check_location(storage):
+    if storage.location.startswith('/'):
+        correct = storage.location.lstrip('/')
+        raise ImproperlyConfigured(
+            "%s.location cannot begin with a leading slash. Found '%s'. Use '%s' instead." % (
+                storage.__class__.__name__,
+                storage.location,
+                correct,
+            )
+        )
+
+
+def lookup_env(names):
+    """
+    Look up for names in environment. Returns the first element
+    found.
+    """
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
