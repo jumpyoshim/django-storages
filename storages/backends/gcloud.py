@@ -1,4 +1,5 @@
 import mimetypes
+from datetime import timedelta
 from tempfile import SpooledTemporaryFile
 
 from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
@@ -8,7 +9,10 @@ from django.utils import timezone
 from django.utils.deconstruct import deconstructible
 from django.utils.encoding import force_bytes, smart_str
 
-from storages.utils import check_location, clean_name, safe_join, setting
+from storages.utils import (
+    check_location, clean_name, get_available_overwrite_name, safe_join,
+    setting,
+)
 
 try:
     from google.cloud.storage.client import Client
@@ -71,8 +75,8 @@ class GoogleCloudFile(File):
     def close(self):
         if self._file is not None:
             if self._is_dirty:
-                self.file.seek(0)
-                self.blob.upload_from_file(self.file, content_type=self.mime_type)
+                self.blob.upload_from_file(self.file, rewind=True,
+                                           content_type=self.mime_type)
             self._file.close()
             self._file = None
 
@@ -86,6 +90,8 @@ class GoogleCloudStorage(Storage):
     auto_create_bucket = setting('GS_AUTO_CREATE_BUCKET', False)
     auto_create_acl = setting('GS_AUTO_CREATE_ACL', 'projectPrivate')
     default_acl = setting('GS_DEFAULT_ACL')
+
+    expiration = setting('GS_EXPIRATION', timedelta(seconds=86400))
 
     file_name_charset = setting('GS_FILE_NAME_CHARSET', 'utf-8')
     file_overwrite = setting('GS_FILE_OVERWRITE', True)
@@ -168,8 +174,7 @@ class GoogleCloudStorage(Storage):
         encoded_name = self._encode_name(name)
         file = GoogleCloudFile(encoded_name, 'rw', self)
         file.blob.cache_control = self.cache_control
-        content.seek(0)
-        file.blob.upload_from_file(content, size=content.size,
+        file.blob.upload_from_file(content, rewind=True, size=content.size,
                                    content_type=file.mime_type)
         if self.default_acl:
             file.blob.acl.save_predefined(self.default_acl)
@@ -249,13 +254,20 @@ class GoogleCloudStorage(Storage):
         return created if setting('USE_TZ') else timezone.make_naive(created)
 
     def url(self, name):
-        # Preserve the trailing slash after normalizing the path.
+        """
+        Return public url or a signed url for the Blob.
+        This DOES NOT check for existance of Blob - that makes codes too slow
+        for many use cases.
+        """
         name = self._normalize_name(clean_name(name))
-        blob = self._get_blob(self._encode_name(name))
-        return blob.public_url
+        blob = self.bucket.blob(self._encode_name(name))
+
+        if self.default_acl == 'publicRead':
+            return blob.public_url
+        return blob.generate_signed_url(self.expiration)
 
     def get_available_name(self, name, max_length=None):
+        name = clean_name(name)
         if self.file_overwrite:
-            name = clean_name(name)
-            return name
+            return get_available_overwrite_name(name, max_length)
         return super(GoogleCloudStorage, self).get_available_name(name, max_length)

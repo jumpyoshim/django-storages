@@ -399,50 +399,58 @@ class S3Boto3StorageTests(S3Boto3TestCase):
         self.storage.bucket.Object.return_value.delete.assert_called_with()
 
     def test_storage_listdir_base(self):
-        file_names = ["some/path/1.txt", "2.txt", "other/path/3.txt", "4.txt"]
+        # Files:
+        #   some/path/1.txt
+        #   2.txt
+        #   other/path/3.txt
+        #   4.txt
+        pages = [
+            {
+                'CommonPrefixes': [
+                    {'Prefix': 'some'},
+                    {'Prefix': 'other'},
+                ],
+                'Contents': [
+                    {'Key': '2.txt'},
+                    {'Key': '4.txt'},
+                ],
+            },
+        ]
 
-        result = []
-        for p in file_names:
-            obj = mock.MagicMock()
-            obj.key = p
-            result.append(obj)
-        self.storage.bucket.objects.filter.return_value = iter(result)
+        paginator = mock.MagicMock()
+        paginator.paginate.return_value = pages
+        self.storage._connections.connection.meta.client.get_paginator.return_value = paginator
 
-        dirs, files = self.storage.listdir("")
-        self.storage.bucket.objects.filter.assert_called_with(Prefix="")
+        dirs, files = self.storage.listdir('')
+        paginator.paginate.assert_called_with(Bucket=None, Delimiter='/', Prefix='')
 
-        self.assertEqual(len(dirs), 2)
-        for directory in ["some", "other"]:
-            self.assertTrue(directory in dirs,
-                            """ "%s" not in directory list "%s".""" % (
-                                directory, dirs))
-
-        self.assertEqual(len(files), 2)
-        for filename in ["2.txt", "4.txt"]:
-            self.assertTrue(filename in files,
-                            """ "%s" not in file list "%s".""" % (
-                                filename, files))
+        self.assertEqual(dirs, ['some', 'other'])
+        self.assertEqual(files, ['2.txt', '4.txt'])
 
     def test_storage_listdir_subdir(self):
-        file_names = ["some/path/1.txt", "some/2.txt"]
+        # Files:
+        #   some/path/1.txt
+        #   some/2.txt
+        pages = [
+            {
+                'CommonPrefixes': [
+                    {'Prefix': 'some/path'},
+                ],
+                'Contents': [
+                    {'Key': 'some/2.txt'},
+                ],
+            },
+        ]
 
-        result = []
-        for p in file_names:
-            obj = mock.MagicMock()
-            obj.key = p
-            result.append(obj)
-        self.storage.bucket.objects.filter.return_value = iter(result)
+        paginator = mock.MagicMock()
+        paginator.paginate.return_value = pages
+        self.storage._connections.connection.meta.client.get_paginator.return_value = paginator
 
-        dirs, files = self.storage.listdir("some/")
-        self.storage.bucket.objects.filter.assert_called_with(Prefix="some/")
+        dirs, files = self.storage.listdir('some/')
+        paginator.paginate.assert_called_with(Bucket=None, Delimiter='/', Prefix='some/')
 
-        self.assertEqual(len(dirs), 1)
-        self.assertTrue('path' in dirs,
-                        """ "path" not in directory list "%s".""" % (dirs,))
-
-        self.assertEqual(len(files), 1)
-        self.assertTrue('2.txt' in files,
-                        """ "2.txt" not in files list "%s".""" % (files,))
+        self.assertEqual(dirs, ['path'])
+        self.assertEqual(files, ['2.txt'])
 
     def test_storage_size(self):
         obj = self.storage.bucket.Object.return_value
@@ -571,3 +579,25 @@ class S3Boto3StorageTests(S3Boto3TestCase):
             "argument will be removed in version 2.0."
         )
         assert str(w[-1].message) == message
+
+    def test_deprecated_default_acl(self):
+        with warnings.catch_warnings(record=True) as w:
+            s3boto3.S3Boto3Storage()
+        assert len(w) == 1
+        message = (
+            "The default behavior of S3Boto3Storage is insecure and will change "
+            "in django-storages 2.0. By default files and new buckets are saved "
+            "with an ACL of 'public-read' (globally publicly readable). Version 2.0 will "
+            "default to using the bucket's ACL. To opt into the new behavior set "
+            "AWS_DEFAULT_ACL = None, otherwise to silence this warning explicitly "
+            "set AWS_DEFAULT_ACL."
+        )
+        assert str(w[-1].message) == message
+
+    def test_deprecated_default_acl_override_class_variable(self):
+        class MyStorage(s3boto3.S3Boto3Storage):
+            default_acl = "private"
+
+        with warnings.catch_warnings(record=True) as w:
+            MyStorage()
+        assert len(w) == 0

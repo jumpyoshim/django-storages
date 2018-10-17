@@ -1,3 +1,4 @@
+import io
 import mimetypes
 import os
 import posixpath
@@ -14,11 +15,13 @@ from django.utils.deconstruct import deconstructible
 from django.utils.encoding import (
     filepath_to_uri, force_bytes, force_text, smart_text,
 )
-from django.utils.six import BytesIO
 from django.utils.six.moves.urllib import parse as urlparse
 from django.utils.timezone import is_naive, localtime
 
-from storages.utils import check_location, lookup_env, safe_join, setting
+from storages.utils import (
+    check_location, get_available_overwrite_name, lookup_env, safe_join,
+    setting,
+)
 
 try:
     import boto3.session
@@ -31,10 +34,6 @@ except ImportError:
 
 
 boto3_version_info = tuple([int(i) for i in boto3_version.split('.')])
-
-if boto3_version_info[:2] < (1, 2):
-    raise ImproperlyConfigured("The installed Boto3 library must be 1.2.0 or "
-                               "higher.\nSee https://github.com/boto/boto3")
 
 
 @deconstructible
@@ -216,8 +215,10 @@ class S3Boto3Storage(Storage):
     ))
     url_protocol = setting('AWS_S3_URL_PROTOCOL', 'http:')
     endpoint_url = setting('AWS_S3_ENDPOINT_URL')
+    proxies = setting('AWS_S3_PROXIES')
     region_name = setting('AWS_S3_REGION_NAME')
     use_ssl = setting('AWS_S3_USE_SSL', True)
+    verify = setting('AWS_S3_VERIFY', None)
     max_memory_size = setting('AWS_S3_MAX_MEMORY_SIZE', 0)
 
     def __init__(self, acl=None, bucket=None, **settings):
@@ -244,13 +245,6 @@ class S3Boto3Storage(Storage):
                 DeprecationWarning,
             )
             self.bucket_name = bucket
-        if self.preload_metadata is not False:
-            warnings.warn(
-                "The AWS_PRELOAD_METADATA setting of S3Boto3Storage is deprecated "
-                "due to major performance and questionable usability issues and "
-                "will be removed in version 2.0. Use a cache instead.",
-                DeprecationWarning,
-            )
 
         check_location(self)
 
@@ -268,11 +262,22 @@ class S3Boto3Storage(Storage):
         self.security_token = self._get_security_token()
 
         if not self.config:
-            self.config = Config(s3={'addressing_style': self.addressing_style},
-                                 signature_version=self.signature_version)
+            kwargs = dict(
+                s3={'addressing_style': self.addressing_style},
+                signature_version=self.signature_version,
+            )
+
+            if boto3_version_info >= (1, 4, 4):
+                kwargs['proxies'] = self.proxies
+            else:
+                warnings.warn(
+                    "In version 2.0 of django-storages the minimum required version of "
+                    "boto3 will be 1.4.4. You have %s " % boto3_version_info
+                )
+            self.config = Config(**kwargs)
 
         # warn about upcoming change in default AWS_DEFAULT_ACL setting
-        if not hasattr(django_settings, 'AWS_DEFAULT_ACL'):
+        if not hasattr(django_settings, 'AWS_DEFAULT_ACL') and self.default_acl == 'public-read':
             warnings.warn(
                 "The default behavior of S3Boto3Storage is insecure and will change "
                 "in django-storages 2.0. By default files and new buckets are saved "
@@ -295,10 +300,6 @@ class S3Boto3Storage(Storage):
 
     @property
     def connection(self):
-        # TODO: Support host, port like in s3boto
-        # Note that proxies are handled by environment variables that the underlying
-        # urllib/requests libraries read. See https://github.com/boto/boto3/issues/338
-        # and http://docs.python-requests.org/en/latest/user/advanced/#proxies
         connection = getattr(self._connections, 'connection', None)
         if connection is None:
             session = boto3.session.Session()
@@ -310,7 +311,8 @@ class S3Boto3Storage(Storage):
                 region_name=self.region_name,
                 use_ssl=self.use_ssl,
                 endpoint_url=self.endpoint_url,
-                config=self.config
+                config=self.config,
+                verify=self.verify,
             )
         return self._connections.connection
 
@@ -383,6 +385,15 @@ class S3Boto3Storage(Storage):
                     #
                     # Also note that Amazon specifically disallows "us-east-1" when passing bucket
                     # region names; LocationConstraint *must* be blank to create in US Standard.
+                    if not hasattr(django_settings, 'AWS_BUCKET_ACL'):
+                        warnings.warn(
+                            "The default behavior of S3Boto3Storage is insecure and will change "
+                            "in django-storages 2.0. By default new buckets are saved with an ACL of "
+                            "'public-read' (globally publicly readable). Version 2.0 will default to "
+                            "Amazon's default of the bucket owner. To opt into this behavior this warning "
+                            "set AWS_BUCKET_ACL = None, otherwise to silence this warning explicitly set "
+                            "AWS_BUCKET_ACL."
+                        )
                     if self.bucket_acl:
                         bucket_params = {'ACL': self.bucket_acl}
                     else:
@@ -393,10 +404,7 @@ class S3Boto3Storage(Storage):
                             'LocationConstraint': region_name}
                     bucket.create(**bucket_params)
                 else:
-                    raise ImproperlyConfigured("Bucket %s does not exist. Buckets "
-                                               "can be automatically created by "
-                                               "setting AWS_AUTO_CREATE_BUCKET to "
-                                               "``True``." % name)
+                    raise
         return bucket
 
     def _clean_name(self, name):
@@ -434,12 +442,12 @@ class S3Boto3Storage(Storage):
     def _compress_content(self, content):
         """Gzip a given string content."""
         content.seek(0)
-        zbuf = BytesIO()
+        zbuf = io.BytesIO()
         #  The GZIP header has a modification time attribute (see http://www.zlib.org/rfc-gzip.html)
         #  This means each time a file is compressed it changes even if the other contents don't change
         #  For S3 this defeats detection of changes using MD5 sums on gzipped files
         #  Fixing the mtime at 0.0 at compression time avoids this problem
-        zfile = GzipFile(mode='wb', compresslevel=6, fileobj=zbuf, mtime=0.0)
+        zfile = GzipFile(mode='wb', fileobj=zbuf, mtime=0.0)
         try:
             zfile.write(force_bytes(content.read()))
         finally:
@@ -527,25 +535,22 @@ class S3Boto3Storage(Storage):
             return False
 
     def listdir(self, name):
-        name = self._normalize_name(self._clean_name(name))
-        # for the bucket.objects.filter and logic below name needs to end in /
-        # But for the root path "" we leave it as an empty string
-        if name and not name.endswith('/'):
-            name += '/'
+        path = self._normalize_name(self._clean_name(name))
+        # The path needs to end with a slash, but if the root is empty, leave
+        # it.
+        if path and not path.endswith('/'):
+            path += '/'
 
+        directories = []
         files = []
-        dirs = set()
-        base_parts = name.split("/")[:-1]
-        for item in self.bucket.objects.filter(Prefix=self._encode_name(name)):
-            parts = item.key.split("/")
-            parts = parts[len(base_parts):]
-            if len(parts) == 1:
-                # File
-                files.append(parts[0])
-            elif len(parts) > 1:
-                # Directory
-                dirs.add(parts[0])
-        return list(dirs), files
+        paginator = self.connection.meta.client.get_paginator('list_objects')
+        pages = paginator.paginate(Bucket=self.bucket_name, Delimiter='/', Prefix=path)
+        for page in pages:
+            for entry in page.get('CommonPrefixes', ()):
+                directories.append(posixpath.relpath(entry['Prefix'], path))
+            for entry in page.get('Contents', ()):
+                files.append(posixpath.relpath(entry['Key'], path))
+        return directories, files
 
     def size(self, name):
         name = self._normalize_name(self._clean_name(name))
@@ -622,7 +627,7 @@ class S3Boto3Storage(Storage):
 
     def get_available_name(self, name, max_length=None):
         """Overwrite existing file with the same name."""
+        name = self._clean_name(name)
         if self.file_overwrite:
-            name = self._clean_name(name)
-            return name
+            return get_available_overwrite_name(name, max_length)
         return super(S3Boto3Storage, self).get_available_name(name, max_length)

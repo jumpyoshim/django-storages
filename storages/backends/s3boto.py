@@ -1,9 +1,12 @@
+import io
 import mimetypes
 import os
+import warnings
 from datetime import datetime
 from gzip import GzipFile
 from tempfile import SpooledTemporaryFile
 
+from django.conf import settings as django_settings
 from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
 from django.core.files.base import File
 from django.core.files.storage import Storage
@@ -12,10 +15,10 @@ from django.utils.deconstruct import deconstructible
 from django.utils.encoding import (
     filepath_to_uri, force_bytes, force_text, smart_str,
 )
-from django.utils.six import BytesIO
 
 from storages.utils import (
-    check_location, clean_name, lookup_env, safe_join, setting,
+    check_location, clean_name, get_available_overwrite_name, lookup_env,
+    safe_join, setting,
 )
 
 try:
@@ -34,6 +37,16 @@ boto_version_info = tuple([int(i) for i in boto_version.split('-')[0].split('.')
 if boto_version_info[:2] < (2, 32):
     raise ImproperlyConfigured("The installed Boto library must be 2.32 or "
                                "higher.\nSee https://github.com/boto/boto")
+
+warnings.warn(
+    "The S3BotoStorage backend is deprecated in favor of the S3Boto3Storage backend "
+    "and will be removed in django-storages 1.8. This backend is mostly in bugfix only "
+    "mode and has been for quite a while (in much the same way as its underlying "
+    "library 'boto'). For performance, security and new feature reasons it is _strongly_ "
+    "recommended that you update to the S3Boto3Storage backend. Please see the migration docs "
+    "https://django-storages.readthedocs.io/en/latest/backends/amazon-S3.html#migrating-boto-to-boto3.",
+    DeprecationWarning
+)
 
 
 @deconstructible
@@ -77,6 +90,15 @@ class S3BotoStorageFile(File):
             self.buffer_size = buffer_size
         self._write_counter = 0
 
+        if not hasattr(django_settings, 'AWS_DEFAULT_ACL'):
+            warnings.warn(
+                "The default behavior of S3BotoStorage is insecure. By default files "
+                "and new buckets are saved with an ACL of 'public-read' (globally "
+                "publicly readable). To change to using the bucket's default ACL "
+                "set AWS_DEFAULT_ACL = None, otherwise to silence this warning "
+                "explicitly set AWS_DEFAULT_ACL."
+            )
+
     @property
     def size(self):
         return self.key.size
@@ -112,9 +134,9 @@ class S3BotoStorageFile(File):
         self._is_dirty = True
         if self._multipart is None:
             provider = self.key.bucket.connection.provider
-            upload_headers = {
-                provider.acl_header: self._storage.default_acl
-            }
+            upload_headers = {}
+            if self._storage.default_acl:
+                upload_headers[provider.acl_header] = self._storage.default_acl
             upload_headers.update({
                 'Content-Type': mimetypes.guess_type(self.key.name)[0] or self._storage.key_class.DefaultContentType
             })
@@ -317,7 +339,15 @@ class S3BotoStorage(Storage):
         except self.connection_response_error:
             if self.auto_create_bucket:
                 bucket = self.connection.create_bucket(name, location=self.origin)
-                bucket.set_acl(self.bucket_acl)
+                if not hasattr(django_settings, 'AWS_BUCKET_ACL'):
+                    warnings.warn(
+                        "The default behavior of S3BotoStorage is insecure. By default new buckets "
+                        "are saved with an ACL of 'public-read' (globally publicly readable). To change "
+                        "to using Amazon's default of the bucket owner set AWS_DEFAULT_ACL = None, "
+                        "otherwise to silence this warning explicitly set AWS_DEFAULT_ACL."
+                    )
+                if self.bucket_acl:
+                    bucket.set_acl(self.bucket_acl)
                 return bucket
             raise ImproperlyConfigured('Bucket %s does not exist. Buckets '
                                        'can be automatically created by '
@@ -350,12 +380,12 @@ class S3BotoStorage(Storage):
 
     def _compress_content(self, content):
         """Gzip a given string content."""
-        zbuf = BytesIO()
+        zbuf = io.BytesIO()
         #  The GZIP header has a modification time attribute (see http://www.zlib.org/rfc-gzip.html)
         #  This means each time a file is compressed it changes even if the other contents don't change
         #  For S3 this defeats detection of changes using MD5 sums on gzipped files
         #  Fixing the mtime at 0.0 at compression time avoids this problem
-        zfile = GzipFile(mode='wb', compresslevel=6, fileobj=zbuf, mtime=0.0)
+        zfile = GzipFile(mode='wb', fileobj=zbuf, mtime=0.0)
         try:
             zfile.write(force_bytes(content.read()))
         finally:
@@ -489,7 +519,7 @@ class S3BotoStorage(Storage):
 
     def get_available_name(self, name, max_length=None):
         """ Overwrite existing file with the same name. """
+        name = self._clean_name(name)
         if self.file_overwrite:
-            name = self._clean_name(name)
-            return name
+            return get_available_overwrite_name(name, max_length)
         return super(S3BotoStorage, self).get_available_name(name, max_length)
